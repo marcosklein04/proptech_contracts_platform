@@ -24,25 +24,22 @@ export default function Contracts() {
   const [extractError, setExtractError] = useState<string | null>(null);
 
   async function loadContracts() {
-    try {
-      setLoading(true);
-      setLoadError(null);
-
-      const data = await getContracts();
-      setContracts(data);
-    } catch {
-      if (IS_DEV) {
-        setContracts(mockContracts);
-      } else {
-        setContracts([]);
-        setLoadError(
-          "No se pudieron cargar los contratos desde el backend. Verificá la URL del API y CORS."
-        );
-      }
-    } finally {
-      setLoading(false);
+  try {
+    setLoading(true);
+    const data = await getContracts();
+    setContracts(data);
+    setLoadError(null);
+  } catch (e) {
+    if (IS_DEV) {
+      setContracts(mockContracts);
+    } else {
+      setContracts([]);
+      setLoadError("No se pudo cargar contratos desde el backend. Revisá VITE_API_URL y CORS.");
     }
+  } finally {
+    setLoading(false);
   }
+}
 
   useEffect(() => {
     loadContracts();
