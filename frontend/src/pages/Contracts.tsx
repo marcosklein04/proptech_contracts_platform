@@ -8,12 +8,15 @@ import { uploadAndExtract } from "../services/contractsUpload";
 
 type Filter = "ALL" | "ACTIVE" | "EXPIRING" | "EXPIRED";
 
+const IS_DEV = import.meta.env.DEV;
+
 export default function Contracts() {
   const [filter, setFilter] = useState<Filter>("ALL");
   const [isUploadOpen, setIsUploadOpen] = useState(false);
 
-  const [contracts, setContracts] = useState<Contract[]>(mockContracts);
+  const [contracts, setContracts] = useState<Contract[]>(IS_DEV ? mockContracts : []);
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [extracting, setExtracting] = useState(false);
@@ -22,11 +25,18 @@ export default function Contracts() {
 
   async function loadContracts() {
     try {
+      setLoadError(null);
       setLoading(true);
       const data = await getContracts();
       setContracts(data);
     } catch {
-      setContracts(mockContracts);
+      // DEV: fallback a mocks. PROD: mostrar vacío + error.
+      if (IS_DEV) {
+        setContracts(mockContracts);
+      } else {
+        setContracts([]);
+        setLoadError("No se pudo cargar contratos desde el backend. Revisá la URL/CORS del API.");
+      }
     } finally {
       setLoading(false);
     }
@@ -86,6 +96,12 @@ export default function Contracts() {
       {loading && (
         <div className="rounded-md border bg-white p-3 text-sm text-gray-700">
           Cargando contratos...
+        </div>
+      )}
+
+      {loadError && (
+        <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+          {loadError}
         </div>
       )}
 
@@ -156,7 +172,7 @@ export default function Contracts() {
                       setExtracted(res.extracted);
                     } catch {
                       setExtractError(
-                        "No se pudo analizar el archivo. Verificá que Flask (5000) y FastAPI (8001) estén corriendo."
+                        "No se pudo analizar el archivo. Verificá que el backend esté online y que /contracts/upload esté disponible."
                       );
                     } finally {
                       setExtracting(false);
@@ -190,7 +206,6 @@ export default function Contracts() {
                       await loadContracts();
                     }}
                     initial={{
-                      // propertyLabel por ahora lo completa el usuario
                       propertyLabel: extracted.propertyLabel ?? "",
                       ownerName: extracted.ownerName ?? "",
                       tenantName: extracted.tenantName ?? "",
@@ -208,4 +223,4 @@ export default function Contracts() {
       )}
     </div>
   );
-}
+} 

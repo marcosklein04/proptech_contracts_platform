@@ -2,6 +2,6 @@ import { api } from "./api";
 import type { Contract } from "../types/contract";
 
 export async function getContracts(): Promise<Contract[]> {
-  const res = await api.get("/contracts");
+  const res = await api.get<Contract[]>("/contracts");
   return res.data;
 }
