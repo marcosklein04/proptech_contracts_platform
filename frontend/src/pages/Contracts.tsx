@@ -2,9 +2,9 @@ import { useEffect, useMemo, useState } from "react";
 import ContractsTable from "../components/contracts/ContractsTable";
 import CreateContractForm from "../components/contracts/CreateContractForm";
 import { getContracts } from "../services/contracts";
-import { mockContracts } from "./contracts.mock";
-import type { Contract } from "../types/contract";
 import { uploadAndExtract } from "../services/contractsUpload";
+import type { Contract } from "../types/contract";
+import { mockContracts } from "./contracts.mock";
 
 type Filter = "ALL" | "ACTIVE" | "EXPIRING" | "EXPIRED";
 
@@ -14,7 +14,7 @@ export default function Contracts() {
   const [filter, setFilter] = useState<Filter>("ALL");
   const [isUploadOpen, setIsUploadOpen] = useState(false);
 
-  const [contracts, setContracts] = useState<Contract[]>(IS_DEV ? mockContracts : []);
+  const [contracts, setContracts] = useState<Contract[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -25,17 +25,19 @@ export default function Contracts() {
 
   async function loadContracts() {
     try {
-      setLoadError(null);
       setLoading(true);
+      setLoadError(null);
+
       const data = await getContracts();
       setContracts(data);
     } catch {
-      // DEV: fallback a mocks. PROD: mostrar vacío + error.
       if (IS_DEV) {
         setContracts(mockContracts);
       } else {
         setContracts([]);
-        setLoadError("No se pudo cargar contratos desde el backend. Revisá la URL/CORS del API.");
+        setLoadError(
+          "No se pudieron cargar los contratos desde el backend. Verificá la URL del API y CORS."
+        );
       }
     } finally {
       setLoading(false);
@@ -143,7 +145,9 @@ export default function Contracts() {
               )}
 
               <div>
-                <label className="text-sm font-medium text-gray-800">Archivo (PDF/DOCX)</label>
+                <label className="text-sm font-medium text-gray-800">
+                  Archivo (PDF/DOCX)
+                </label>
                 <input
                   type="file"
                   className="mt-1 block w-full rounded-md border p-2 text-sm"
@@ -163,16 +167,13 @@ export default function Contracts() {
                   onClick={async () => {
                     if (!selectedFile) return;
 
-                    setExtractError(null);
-                    setExtracted(null);
-
                     try {
                       setExtracting(true);
                       const res = await uploadAndExtract(selectedFile);
                       setExtracted(res.extracted);
                     } catch {
                       setExtractError(
-                        "No se pudo analizar el archivo. Verificá que el backend esté online y que /contracts/upload esté disponible."
+                        "No se pudo analizar el archivo. Verificá que el backend esté activo."
                       );
                     } finally {
                       setExtracting(false);
@@ -193,10 +194,6 @@ export default function Contracts() {
 
               {extracted && (
                 <div className="mt-3 rounded-lg border bg-gray-50 p-4">
-                  <div className="mb-2 text-sm font-medium text-gray-900">
-                    Datos detectados (editables)
-                  </div>
-
                   <CreateContractForm
                     onCancel={() => setIsUploadOpen(false)}
                     onCreated={async () => {
@@ -223,4 +220,4 @@ export default function Contracts() {
       )}
     </div>
   );
-} 
+}
