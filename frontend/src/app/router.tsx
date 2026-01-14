@@ -1,5 +1,5 @@
 import { createBrowserRouter, Navigate } from "react-router-dom";
-import { ReactNode } from "react";
+import type { ReactNode } from "react";
 
 import AppLayout from "../components/layout/AppLayout";
 import Login from "../pages/Login";
