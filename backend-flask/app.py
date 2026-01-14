@@ -7,13 +7,32 @@ from sqlalchemy import create_engine, text
 def create_app():
     app = Flask(__name__)
 
-    cors_origins = os.getenv("CORS_ORIGINS", "*")
-    CORS(app, resources={r"/*": {"origins": cors_origins}}, supports_credentials=True)
+    # =========================
+    # CORS (PROD-ready)
+    # =========================
+    cors_origins = os.getenv("CORS_ORIGINS", "*").strip()
 
+    if cors_origins == "*":
+        origins = "*"
+    else:
+        origins = [o.strip() for o in cors_origins.split(",") if o.strip()]
+
+    CORS(
+        app,
+        resources={r"/*": {"origins": origins}},
+        supports_credentials=False,  # no usamos cookies; evita conflicto con '*'
+        allow_headers=["Content-Type", "Authorization"],
+        methods=["GET", "POST", "OPTIONS"],
+    )
+
+    # =========================
+    # DB
+    # =========================
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL env var is required")
 
+    # Render a veces provee postgres:// (deprecated en SQLAlchemy)
     database_url = database_url.replace("postgres://", "postgresql://", 1)
 
     engine = create_engine(database_url, pool_pre_ping=True)
@@ -34,8 +53,14 @@ def create_app():
                 );
             """))
 
+    # =========================
+    # IA Service
+    # =========================
     IA_EXTRACTOR_URL = os.getenv("IA_EXTRACTOR_URL", "http://127.0.0.1:8001/extract")
 
+    # =========================
+    # Routes
+    # =========================
     @app.get("/health")
     def health():
         return {"ok": True}
@@ -67,6 +92,7 @@ def create_app():
                     "frequencyMonths": 3 if r["adjustment_type"] == "IPC_QUARTERLY" else None
                 }
             })
+
         return jsonify(data)
 
     @app.post("/contracts")
