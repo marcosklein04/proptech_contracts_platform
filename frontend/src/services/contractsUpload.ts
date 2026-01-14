@@ -19,9 +19,7 @@ export async function uploadAndExtract(file: File): Promise<{
   const fd = new FormData();
   fd.append("file", file);
 
-  const res = await api.post("/contracts/upload", fd, {
-    headers: { "Content-Type": "multipart/form-data" },
-  });
+  const res = await api.post("/contracts/upload", fd);
 
   return res.data;
 }
