@@ -20,7 +20,7 @@ def create_app():
     CORS(
         app,
         resources={r"/*": {"origins": origins}},
-        supports_credentials=False,  # no usamos cookies; evita conflicto con '*'
+        supports_credentials=False,  # no cookies; evita conflicto con '*'
         allow_headers=["Content-Type", "Authorization"],
         methods=["GET", "POST", "OPTIONS"],
     )
@@ -32,9 +32,7 @@ def create_app():
     if not database_url:
         raise RuntimeError("DATABASE_URL env var is required")
 
-    # Render a veces provee postgres:// (deprecated en SQLAlchemy)
     database_url = database_url.replace("postgres://", "postgresql://", 1)
-
     engine = create_engine(database_url, pool_pre_ping=True)
 
     def init_db():
@@ -58,12 +56,30 @@ def create_app():
     # =========================
     IA_EXTRACTOR_URL = os.getenv("IA_EXTRACTOR_URL", "http://127.0.0.1:8001/extract")
 
+    # Timeouts (segundos)
+    # connect_timeout: tiempo máximo para conectar
+    # read_timeout: tiempo máximo esperando respuesta (documentos largos)
+    IA_CONNECT_TIMEOUT = int(os.getenv("IA_CONNECT_TIMEOUT", "10"))
+    IA_READ_TIMEOUT = int(os.getenv("IA_READ_TIMEOUT", "300"))  # 5 min recomendado
+
     # =========================
     # Routes
     # =========================
     @app.get("/health")
     def health():
         return {"ok": True}
+
+    # Opcional: verificar IA desde backend
+    @app.get("/ia/health")
+    def ia_health():
+        try:
+            # Si tu IA tiene /health (la tuya lo tiene)
+            base = IA_EXTRACTOR_URL.replace("/extract", "")
+            r = requests.get(f"{base}/health", timeout=(IA_CONNECT_TIMEOUT, 30))
+            r.raise_for_status()
+            return r.json(), 200
+        except Exception as e:
+            return {"ok": False, "detail": str(e)}, 502
 
     @app.get("/contracts")
     def list_contracts():
@@ -141,14 +157,35 @@ def create_app():
         if not (filename.endswith(".pdf") or filename.endswith(".docx")):
             return {"error": "Only .pdf or .docx supported"}, 400
 
-        files = {"file": (f.filename, f.read(), "application/octet-stream")}
+        # Nota: read() consume el stream; está bien para mandarlo a IA
+        file_bytes = f.read()
+        files = {"file": (f.filename, file_bytes, "application/octet-stream")}
+
         try:
-            r = requests.post(IA_EXTRACTOR_URL, files=files, timeout=60)
+            r = requests.post(
+                IA_EXTRACTOR_URL,
+                files=files,
+                timeout=(IA_CONNECT_TIMEOUT, IA_READ_TIMEOUT),
+            )
             r.raise_for_status()
+
+            # Asegurar JSON
+            try:
+                return jsonify(r.json()), 200
+            except ValueError:
+                return {
+                    "error": "IA returned non-JSON response",
+                    "status_code": r.status_code,
+                    "text_preview": r.text[:400],
+                }, 502
+
+        except requests.Timeout:
+            return {
+                "error": "IA service timeout",
+                "detail": f"Timeout after {IA_READ_TIMEOUT}s waiting IA response",
+            }, 502
         except requests.RequestException as e:
             return {"error": "IA service unavailable", "detail": str(e)}, 502
-
-        return r.json(), 200
 
     return app
 
