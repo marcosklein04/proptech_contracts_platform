@@ -1,378 +1,397 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 import re
-import io
-from typing import Optional, Tuple, Dict
+from datetime import date
+from typing import Optional, Tuple, Dict, Any
 
-app = FastAPI(title="IA Contract Extractor (Rules v2)")
+app = FastAPI(title="IA Extractor", version="1.0.0")
 
-# =========================
-# Utils
-# =========================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # en prod podés restringir
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def normalize(s: str) -> str:
-    return re.sub(r"\s+", " ", s.strip())
-
-def clean_person_prefix(name: str) -> str:
-    # el/la señor(a), sr/sra, etc.
-    return re.sub(
-        r"^(el|la)\s+(señor|señora)\s*:?\s*|^(sr\.?|sra\.?)\s*:?\s*",
-        "",
-        name.strip(),
-        flags=re.IGNORECASE
-    )
-
-def clean_quotes(s: str) -> str:
-    return s.replace("“", '"').replace("”", '"').replace("’", "'").replace("´", "'")
-
-# =========================
-# Text extraction
-# =========================
-
-def extract_text_from_docx(content: bytes) -> str:
-    from docx import Document
-    doc = Document(io.BytesIO(content))
-    return "\n".join(p.text for p in doc.paragraphs if p.text)
-
-def extract_text_from_pdf(content: bytes) -> str:
-    import pdfplumber
-    text = []
-    with pdfplumber.open(io.BytesIO(content)) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                text.append(t)
-    return "\n".join(text)
-
+# -------------------------
+# Utils: texto desde archivo
+# -------------------------
 def extract_text_from_file(content: bytes, filename: str) -> str:
-    fname = filename.lower()
-    if fname.endswith(".docx"):
-        return extract_text_from_docx(content)
-    if fname.endswith(".pdf"):
-        return extract_text_from_pdf(content)
-    raise ValueError("Unsupported file type (only .pdf or .docx)")
-
-# =========================
-# Contract type detection
-# =========================
-
-def detect_contract_type(text: str) -> str:
-    t = text.lower()
-    # priorizar comodato si aparece explícito
-    if "comodato" in t or "comodante" in t or "comodatari" in t:
-        return "COMODATO"
-    if "locación" in t or "locador" in t or "locatari" in t or "alquiler" in t:
-        return "LOCACION"
-    return "UNKNOWN"
-
-# =========================
-# Parties detection (roles)
-# =========================
-
-def _extract_between(text: str, start_pat: str, end_pat: str) -> Optional[str]:
-    m = re.search(start_pat + r"(.+?)" + end_pat, text, re.IGNORECASE | re.DOTALL)
-    if not m:
-        return None
-    return normalize(m.group(1))
-
-def detect_parties(text: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Devuelve (owner, tenant) mapeado a:
-    - LOCACION: owner=LOCADOR/LOCADORA, tenant=LOCATARIO/LOCATARIA
-    - COMODATO: owner=COMODANTE, tenant=COMODATARIO/COMODATARIA
+    Asumimos que ya tenés implementado DOCX/PDF en tu proyecto.
+    Si lo tenés en otro módulo, importalo y reemplazá esta función.
     """
-    t = clean_quotes(text)
+    name = (filename or "").lower()
 
-    ctype = detect_contract_type(t)
+    if name.endswith(".docx"):
+        # DOCX
+        try:
+            import docx  # python-docx
+            from io import BytesIO
+            doc = docx.Document(BytesIO(content))
+            parts = []
+            for p in doc.paragraphs:
+                t = (p.text or "").strip()
+                if t:
+                    parts.append(t)
+            return "\n".join(parts)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Cannot read docx: {e}")
 
-    owner = None
-    tenant = None
+    if name.endswith(".pdf"):
+        # PDF
+        try:
+            import fitz  # PyMuPDF
+            import io
+            pdf = fitz.open(stream=io.BytesIO(content), filetype="pdf")
+            parts = []
+            for page in pdf:
+                t = (page.get_text() or "").strip()
+                if t:
+                    parts.append(t)
+            return "\n".join(parts)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Cannot read pdf: {e}")
 
-    # --- LOCACION: patrones fuertes ---
-    if ctype in ("LOCACION", "UNKNOWN"):
-        # Caso típico: "entre <NOMBRE> con DNI ... denominado EL LOCADOR/LA LOCADORA"
-        owner = _extract_between(
-            t,
-            r"\bentre\s+",
-            r"\s+con\s+DNI.*?\bdenominad[oa]\s+\"?(EL\s+LOCADOR|LA\s+LOCADORA)\"?"
-        )
+    raise HTTPException(status_code=400, detail="Only .pdf or .docx supported")
 
-        # Caso típico locatario: "y por la otra ... <NOMBRE>, con DNI ... denominado EL LOCATARIO/LA LOCATARIA"
-        tenant = _extract_between(
-            t,
-            r"\bpor\s+la\s+otra\b.*?(?:el|la)?\s*(?:señor|señora|sr\.?|sra\.?)?\s*:?\s*",
-            r"\s*,\s*con\s+DNI.*?\bdenominad[oa]\s+\"?(EL\s+LOCATARIO|LA\s+LOCATARIA)\"?"
-        )
 
-        # Fallbacks: "LOCADOR: X" / "LOCATARIO: X"
-        if not owner:
-            m = re.search(r"\b(LOCADOR|LOCADORA|PROPIETARIO|PROPIETARIA)\s*[:\-]\s*([^\n]+)", t, re.IGNORECASE)
-            if m:
-                owner = normalize(m.group(2))
+def normalize_spaces(s: str) -> str:
+    s = s.replace("\u00a0", " ")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
 
-        if not tenant:
-            m = re.search(r"\b(LOCATARIO|LOCATARIA|INQUILINO|INQUILINA)\s*[:\-]\s*([^\n]+)", t, re.IGNORECASE)
-            if m:
-                tenant = normalize(m.group(2))
 
-    # --- COMODATO: patrones fuertes ---
-    if ctype == "COMODATO":
-        # "en adelante denominada LA PARTE COMODANTE"
-        owner = _extract_between(
-            t,
-            r"\bentre\s+.*?\bentre\s+",  # por si viene "Entre entre ..."
-            r"\s+con\s+DNI.*?\ben\s+adelante\s+denominad[oa]\s+\"?LA\s+PARTE\s+COMODANTE\"?"
-        ) or _extract_between(
-            t,
-            r"\bentre\s+",
-            r"\s+con\s+DNI.*?\ben\s+adelante\s+denominad[oa]\s+\"?LA\s+PARTE\s+COMODANTE\"?"
-        )
-
-        # "en adelante denominado LA PARTE COMODATARIA / COMODATARIO"
-        tenant = _extract_between(
-            t,
-            r"\bpor\s+la\s+otra\b.*?(?:el|la)?\s*(?:señor|señora|sr\.?|sra\.?)?\s*:?\s*",
-            r"\s*,.*?\ben\s+adelante\s+denominad[oa]\s+\"?LA\s+PARTE\s+COMODATARI[OA]\"?"
-        )
-
-        # Fallbacks explícitos
-        if not owner:
-            m = re.search(r"\b(COMODANTE)\s*[:\-]\s*([^\n]+)", t, re.IGNORECASE)
-            if m:
-                owner = normalize(m.group(2))
-
-        if not tenant:
-            m = re.search(r"\b(COMODATARI[OA])\s*[:\-]\s*([^\n]+)", t, re.IGNORECASE)
-            if m:
-                tenant = normalize(m.group(2))
-
-    if owner:
-        owner = clean_person_prefix(owner)
-    if tenant:
-        tenant = clean_person_prefix(tenant)
-
-    return owner, tenant
-
-# =========================
-# Property label detection
-# =========================
-
-def detect_property_label(text: str) -> Optional[str]:
-    """
-    Prioriza dirección del INMUEBLE (no domicilio personal):
-    1) "domicilio a efectos de este contrato en <...>"
-    2) "ubicado/sito en <...>"
-    3) encabezado: "CONTRATO ... <DIRECCION> – CABA"
-    4) fallback: primera línea con pinta de dirección
-    """
-    t = clean_quotes(text)
-
-    # 1) domicilio a efectos de este contrato (suele ser el inmueble)
-    m = re.search(
-        r"\bdomicilio\s+a\s+efectos\s+de\s+este\s+contrato\s+en\s+(la\s+)?(.+?)(?:,|\n|;)\s*(?:en\s+adelante|denominad|en\s+la\s+ciudad|manife|manifest)",
-        t,
-        re.IGNORECASE | re.DOTALL
-    )
-    if m:
-        candidate = normalize(m.group(2))
-        return _cleanup_address(candidate)
-
-    # 2) ubicado/sito en
-    m = re.search(
-        r"\b(ubicad[oa]|sit[oa])\s+en\s+(la\s+)?(.+?)(?:,|\n|;)",
-        t,
-        re.IGNORECASE | re.DOTALL
-    )
-    if m:
-        candidate = normalize(m.group(3))
-        return _cleanup_address(candidate)
-
-    # 3) encabezado: CONTRATO ... <direccion> (hasta salto)
-    first_lines = "\n".join(t.splitlines()[:5])
-    m = re.search(
-        r"(CONTRATO.+?)\n",
-        first_lines,
-        re.IGNORECASE
-    )
-    if m:
-        line = normalize(m.group(1))
-        # buscar algo que parezca dirección dentro de esa línea
-        addr = _extract_address_from_line(line)
-        if addr:
-            return _cleanup_address(addr)
-
-    # 4) fallback: primer renglón que parezca dirección
-    for ln in t.splitlines()[:15]:
-        ln2 = normalize(ln)
-        if _looks_like_address(ln2):
-            return _cleanup_address(ln2)
-
-    return None
-
-def _cleanup_address(addr: str) -> str:
-    a = addr
-    a = a.replace("N°", "").replace("Nº", "")
-    a = re.sub(r"\s+", " ", a).strip()
-    # limpiar comillas sueltas
-    a = a.replace('"', "").strip()
-    return a
-
-def _looks_like_address(line: str) -> bool:
-    # heurística simple: calle/av + número
-    return bool(re.search(r"\b(Av\.?|Avenida|Calle|Juramento|Santos|Federico|Laprida|Rodr[ií]guez)\b", line, re.IGNORECASE)) and bool(re.search(r"\b\d{3,5}\b", line))
-
-def _extract_address_from_line(line: str) -> Optional[str]:
-    # intenta encontrar: "AV. FEDERICO LACROZE 3060 9° F – CABA"
-    m = re.search(r"\b(Av\.?|Avenida|Calle)\b.*", line, re.IGNORECASE)
-    if m:
-        return normalize(m.group(0))
-    # si no, devolver la línea si tiene número grande
-    if re.search(r"\b\d{3,5}\b", line):
-        return line
-    return None
-
-# =========================
-# Dates detection (stronger)
-# =========================
-
-MONTHS = {
-    "enero": "01", "febrero": "02", "marzo": "03", "abril": "04",
-    "mayo": "05", "junio": "06", "julio": "07", "agosto": "08",
-    "septiembre": "09", "setiembre": "09", "octubre": "10",
-    "noviembre": "11", "diciembre": "12"
+# -------------------------
+# Normalización de fechas
+# -------------------------
+SPANISH_MONTHS = {
+    "enero": 1,
+    "febrero": 2,
+    "marzo": 3,
+    "abril": 4,
+    "mayo": 5,
+    "junio": 6,
+    "julio": 7,
+    "agosto": 8,
+    "septiembre": 9,
+    "setiembre": 9,
+    "octubre": 10,
+    "noviembre": 11,
+    "diciembre": 12,
 }
 
-def _date_words_to_iso(dd: str, mon: str, yy: str) -> Optional[str]:
-    mm = MONTHS.get(mon.lower())
-    if not mm:
+def iso_date(y: int, m: int, d: int) -> str:
+    return f"{y:04d}-{m:02d}-{d:02d}"
+
+def parse_spanish_date(text: str) -> Optional[str]:
+    """
+    Reconoce formatos típicos:
+    - "1° de febrero de 2026"
+    - "31 de enero del 2028"
+    - "12 días del mes de noviembre de 2025" (toma 12/nov/2025)
+    """
+    t = text.lower()
+
+    # 1) "1° de febrero de 2026" / "1 de febrero del 2026"
+    m1 = re.search(
+        r"\b(\d{1,2})(?:\s*°|\s*º)?\s+de\s+([a-záéíóú]+)\s+(?:de|del)\s+(\d{4})\b",
+        t,
+        re.IGNORECASE,
+    )
+    if m1:
+        d = int(m1.group(1))
+        mon = m1.group(2)
+        y = int(m1.group(3))
+        mon = mon.replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u")
+        if mon in SPANISH_MONTHS:
+            return iso_date(y, SPANISH_MONTHS[mon], d)
+
+    # 2) "a los 12 días del mes de noviembre de 2025"
+    m2 = re.search(
+        r"\ba\s+los\s+(\d{1,2})\s+d[ií]as\s+del\s+mes\s+de\s+([a-záéíóú]+)\s+de\s+(\d{4})\b",
+        t,
+        re.IGNORECASE,
+    )
+    if m2:
+        d = int(m2.group(1))
+        mon = m2.group(2)
+        y = int(m2.group(3))
+        mon = mon.replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u")
+        if mon in SPANISH_MONTHS:
+            return iso_date(y, SPANISH_MONTHS[mon], d)
+
+    return None
+
+
+def find_date_by_patterns(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Busca start/end usando expresiones típicas de contrato.
+    """
+    t = text
+
+    # START: "a partir del día X" / "comenzará el día X" / "inicio de la locación X"
+    start_patterns = [
+        r"(?:a\s+partir\s+del\s+d[ií]a|comenzar[aá]\s+el\s+d[ií]a|inicio\s+de\s+la\s+locaci[oó]n(?:\s+ser[aá])?)\s*[:\-]?\s*([^\n\.]{0,80})",
+        r"(?:rige\s+desde)\s*[:\-]?\s*([^\n\.]{0,80})",
+    ]
+    start_date = None
+    for pat in start_patterns:
+        m = re.search(pat, t, re.IGNORECASE)
+        if m:
+            candidate = m.group(1)
+            start_date = parse_spanish_date(candidate) or parse_spanish_date(candidate.replace("°", ""))
+            if start_date:
+                break
+
+    # END: "vencerá el día X" / "hasta el día X" / "finaliza el día X" / "vence el día X"
+    end_patterns = [
+        r"(?:vencer[aá]\s+(?:indefectiblemente\s+)?el\s+d[ií]a|hasta\s+el\s+d[ií]a|finaliza\s+el\s+d[ií]a|vence\s+el\s+d[ií]a)\s*[:\-]?\s*([^\n\.]{0,80})",
+        r"(?:plazo\s+de\s+la\s+locaci[oó]n\s+.*?hasta)\s*[:\-]?\s*([^\n\.]{0,80})",
+    ]
+    end_date = None
+    for pat in end_patterns:
+        m = re.search(pat, t, re.IGNORECASE)
+        if m:
+            candidate = m.group(1)
+            end_date = parse_spanish_date(candidate) or parse_spanish_date(candidate.replace("°", ""))
+            if end_date:
+                break
+
+    return start_date, end_date
+
+
+# -------------------------
+# Monto y moneda
+# -------------------------
+def detect_currency(text: str) -> str:
+    t = text.upper()
+    # señales USD
+    if re.search(r"\bUSD\b|\bU\$S\b|D[ÓO]LAR(?:ES)?\b", t):
+        return "USD"
+    # señales ARS
+    if re.search(r"\bARS\b|\bPESOS\b|\$\s*\d", t):
+        return "ARS"
+    return "ARS"
+
+
+def parse_amount_number(s: str) -> Optional[float]:
+    """
+    Convierte:
+    - "650.000" -> 650000
+    - "650,000" -> 650000
+    - "650000" -> 650000
+    - "650.000,50" -> 650000.50
+    """
+    s = s.strip()
+    # mantener dígitos, puntos y comas
+    s = re.sub(r"[^\d\.,]", "", s)
+    if not s:
         return None
-    return f"{yy}-{mm}-{int(dd):02d}"
 
-def detect_dates(text: str) -> Tuple[Optional[str], Optional[str]]:
-    t = clean_quotes(text)
+    # Caso típico AR: miles con '.', decimales con ','
+    if "," in s and "." in s:
+        # si el último separador es coma => coma decimal
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "")
+            s = s.replace(",", ".")
+        else:
+            # raro, pero: "1,234.56"
+            s = s.replace(",", "")
+    else:
+        # si solo tiene comas y parecen miles: "650,000"
+        if "," in s and len(s.split(",")[-1]) == 3:
+            s = s.replace(",", "")
+        # si solo tiene puntos y parecen miles: "650.000"
+        if "." in s and len(s.split(".")[-1]) == 3:
+            s = s.replace(".", "")
 
-    # A) dd/mm/yyyy (si aparecen “inicio” y “fin” en el contexto, mejor)
-    # primero intentar con contexto fuerte:
-    m = re.search(r"\b(a\s+partir\s+del|comienza|inicio)\b.*?\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b", t, re.IGNORECASE | re.DOTALL)
-    start = None
-    if m:
-        dd, mm, yy = m.group(2), m.group(3), m.group(4)
-        start = f"{yy}-{int(mm):02d}-{int(dd):02d}"
+    try:
+        return float(s)
+    except:
+        return None
 
-    m = re.search(r"\b(hasta|vence|fin|finaliza)\b.*?\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b", t, re.IGNORECASE | re.DOTALL)
-    end = None
-    if m:
-        dd, mm, yy = m.group(2), m.group(3), m.group(4)
-        end = f"{yy}-{int(mm):02d}-{int(dd):02d}"
 
-    if start or end:
-        return start, end
+def detect_amount(text: str) -> Optional[float]:
+    """
+    Busca el canon locativo / alquiler mensual.
+    Evita (en lo posible) confundir con depósito, multas, etc.
+    """
+    t = text
 
-    # B) "a partir del 1 de noviembre de 2025" / "hasta el 31 de octubre de 2026"
-    m = re.search(r"\b(a\s+partir\s+del|comienza|inicio)\b.*?\b(\d{1,2})\s+de\s+([a-záéíóúñ]+)\s+de\s+(\d{4})\b", t, re.IGNORECASE | re.DOTALL)
-    if m:
-        start = _date_words_to_iso(m.group(2), m.group(3), m.group(4))
-
-    m = re.search(r"\b(hasta|vence|fin|finaliza)\b.*?\b(\d{1,2})\s+de\s+([a-záéíóúñ]+)\s+de\s+(\d{4})\b", t, re.IGNORECASE | re.DOTALL)
-    if m:
-        end = _date_words_to_iso(m.group(2), m.group(3), m.group(4))
-
-    if start or end:
-        return start, end
-
-    # C) Si no hay “inicio/fin”, intentar “plazo de X meses/años desde <fecha>”
-    m = re.search(
-        r"\bplazo\s+de\s+(\d{1,3})\s+(meses|años)\b.*?\bdesde\s+el\s+(\d{1,2})\s+de\s+([a-záéíóúñ]+)\s+de\s+(\d{4})\b",
-        t,
-        re.IGNORECASE | re.DOTALL
-    )
-    if m:
-        n = int(m.group(1))
-        unit = m.group(2).lower()
-        start = _date_words_to_iso(m.group(3), m.group(4), m.group(5))
-        # end la dejamos en None si no querés sumar meses/años en reglas (podemos hacerlo luego)
-        # para no “inventar” fin.
-        return start, None
-
-    # D) fecha de firma "En la Ciudad..., a los 12 días del mes de noviembre de 2025"
-    m = re.search(
-        r"\b(\d{1,2})\s+d[ií]as?\s+del\s+mes\s+de\s+([a-záéíóúñ]+)\s+de\s+(\d{4})\b",
-        t,
-        re.IGNORECASE
-    )
-    if m:
-        signed = _date_words_to_iso(m.group(1), m.group(2), m.group(3))
-        return signed, None
-
-    return None, None
-
-# =========================
-# Amount & currency detection (safer)
-# =========================
-
-def detect_amount_and_currency(text: str) -> Tuple[Optional[float], str]:
-    t = clean_quotes(text).replace("\u00a0", " ")
-
-    # Patrones más “locación”
+    # 1) "Pesos seiscientos cincuenta mil ($ 650.000) por mes"
+    # 2) "la suma de $ 590.000 (pesos ...)"
+    # 3) "USD 900"
     patterns = [
-        r"\b(canon\s+locativo|alquiler|precio\s+mensual|valor\s+mensual)\b.*?(USD|U\$S)\s*([\d\.\,]+)",
-        r"\b(canon\s+locativo|alquiler|precio\s+mensual|valor\s+mensual)\b.*?\$\s*([\d\.\,]+)",
-        r"\b(USD|U\$S)\s*([\d\.\,]+)\b",
+        r"(?:alquiler|canon\s+locativo|precio\s+mensual|valor\s+mensual|monto\s+mensual|la\s+suma\s+de)\s*[:\-]?\s*(?:pesos|ars|\$|usd|u\$s|d[oó]lares)?\s*([\$]?\s*[\d\.\,]{3,})",
+        r"\b(USD|U\$S)\s*([\d\.\,]{2,})\b",
+        r"\$\s*([\d\.\,]{3,})",
     ]
 
-    for p in patterns:
-        m = re.search(p, t, re.IGNORECASE | re.DOTALL)
-        if not m:
-            continue
+    # Preferir contexto "mensual" / "por mes"
+    monthly = re.search(r"([\$]?\s*[\d\.\,]{3,}).{0,40}(?:por\s+mes|mensual)", t, re.IGNORECASE)
+    if monthly:
+        return parse_amount_number(monthly.group(1))
 
-        # tomar el último grupo numérico
-        nums = [g for g in m.groups() if g and re.search(r"\d", g)]
-        if not nums:
-            continue
+    for pat in patterns:
+        m = re.search(pat, t, re.IGNORECASE)
+        if m:
+            if len(m.groups()) == 2 and (m.group(1) or "").upper() in ["USD", "U$S"]:
+                return parse_amount_number(m.group(2))
+            return parse_amount_number(m.group(1))
 
-        raw = nums[-1]
-        amount = float(raw.replace(".", "").replace(",", "."))
+    return None
 
-        currency = "ARS"
-        if "USD" in m.group(0).upper() or "U$S" in m.group(0).upper():
-            currency = "USD"
 
-        return amount, currency
+# -------------------------
+# Partes (owner/tenant) + roles
+# -------------------------
+def clean_person_name(raw: str) -> str:
+    s = raw.strip()
 
-    # Si es comodato, muchas veces NO hay monto: NO inventar.
-    # Pero si el texto tiene "$" suelto, no lo tomamos sin contexto de alquiler/canon
-    return None, "ARS"
+    # cortar si engancha texto extra típico
+    s = re.split(r"\b(con\s+dni|dni|de\s+nacionalidad|tel[eé]fono|correo|e-?mail|en\s+adelante)\b", s, flags=re.IGNORECASE)[0]
+    s = s.strip(" ,;:.-\n\t\"“”")
+    # eliminar dobles espacios
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
 
-# =========================
-# Adjustment rule
-# =========================
+def find_party_by_role(text: str, role_regex: str) -> Optional[str]:
+    """
+    Busca el nombre cerca de 'en adelante denominado/a "EL LOCADOR/LOCADORA"...'
+    """
+    m = re.search(role_regex, text, re.IGNORECASE)
+    if not m:
+        return None
+    before = text[: m.start()]
+    # Tomar ventana previa
+    window = before[-350:]
 
-def build_adjustment(amount: Optional[float], currency: str) -> Dict:
-    # Si no hay monto, no tiene sentido hablar de ajuste automático
-    if amount is None:
-        return {"type": "NONE"}
-    if currency == "ARS":
+    # Intentar: "... entre <NOMBRE> con DNI ..."
+    m2 = re.search(r"(?:entre|por\s+una\s+parte,?\s+)?\s*([A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑñ\.\s]{3,80})\s+con\s+DNI", window, re.IGNORECASE)
+    if m2:
+        return clean_person_name(m2.group(1))
+
+    # Intentar: "... el señor/la señora: <NOMBRE>, con DNI ..."
+    m3 = re.search(r"(?:el|la)\s+(?:señor|señora|sr\.?|sra\.?)\s*:?[\s]*([A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑñ\.\s]{3,80})\s*,?\s+con\s+DNI", window, re.IGNORECASE)
+    if m3:
+        return clean_person_name(m3.group(1))
+
+    # Último intento: nombre “sueltito” antes de la etiqueta
+    m4 = re.search(r"([A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑñ\.\s]{3,80})\s*$", window.strip())
+    if m4:
+        return clean_person_name(m4.group(1))
+
+    return None
+
+
+def detect_parties(text: str) -> Tuple[Optional[str], Optional[str], str, str]:
+    """
+    Retorna owner, tenant, owner_role_label, tenant_role_label
+    Soporta: LOCADOR/A - LOCATARIO/A y COMODANTE - COMODATARIO/A
+    """
+    # Roles locación
+    owner = find_party_by_role(text, r"en\s+adelante\s+denominad[oa]\s+\"?(EL|LA)\s+LOCADOR[A]?\"?")
+    tenant = find_party_by_role(text, r"en\s+adelante\s+denominad[oa]\s+\"?(EL|LA)\s+LOCATARI[OA]\"?")
+
+    owner_label = "LOCADOR/LOCADORA"
+    tenant_label = "LOCATARIO/LOCATARIA"
+
+    # Si no encontró por locación, probar comodato
+    if not owner or not tenant:
+        comodante = find_party_by_role(text, r"en\s+adelante\s+denominad[oa]\s+\"?LA\s+PARTE\s+COMODANTE\"?")
+        comodatario = find_party_by_role(text, r"en\s+adelante\s+denominad[oa]\s+\"?LA\s+PARTE\s+COMODATARI[OA]\"?")
+
+        if comodante and not owner:
+            owner = comodante
+            owner_label = "COMODANTE"
+        if comodatario and not tenant:
+            tenant = comodatario
+            tenant_label = "COMODATARIO/COMODATARIA"
+
+    # Fallback clásico: "entre X ... y por la otra Y ..."
+    if not owner or not tenant:
+        m = re.search(
+            r"entre\s+([A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑñ\.\s]{3,80})\s+con\s+DNI.*?y\s+por\s+la\s+otra.*?(?:señor|señora|sr\.?|sra\.?)\s*:?\s*([A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑñ\.\s]{3,80})\s*,?\s+con\s+DNI",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if m:
+            owner = owner or clean_person_name(m.group(1))
+            tenant = tenant or clean_person_name(m.group(2))
+
+    return owner, tenant, owner_label, tenant_label
+
+
+# -------------------------
+# Inmueble / propertyLabel
+# -------------------------
+def detect_property_label(text: str) -> Optional[str]:
+    """
+    Prioridades:
+    1) Encabezado tipo "CONTRATO ... AV. XXX ..."
+    2) "ubicado en la calle ... N° ... Piso ... Dto ..."
+    """
+    # Encabezado: tomar la primera línea si contiene dirección
+    first_lines = "\n".join(text.splitlines()[:5])
+    m1 = re.search(r"(?:CONTRATO|COMODATO)[^\n]*\s+([A-ZÁÉÍÓÚÑ][^\n]{8,120})", first_lines, re.IGNORECASE)
+    if m1:
+        candidate = m1.group(1).strip()
+        # Evitar agarrar "DE LOCACIÓN A TIEMPO DETERMINADO" sin dirección
+        if re.search(r"\d", candidate) and (("caba" in candidate.lower()) or ("av" in candidate.lower()) or ("calle" in candidate.lower()) or ("n°" in candidate.lower()) or ("numero" in candidate.lower())):
+            return candidate
+
+    # Cuerpo: "ubicado en la calle Santos Dumont N° 2475 Piso 11° Dto. F de CABA"
+    m2 = re.search(
+        r"(?:ubicad[oa]\s+en\s+la\s+calle|domicilio\s+en\s+la\s+calle|inmueble\s+ubicado\s+en)\s+([^\n\.]{10,160})",
+        text,
+        re.IGNORECASE,
+    )
+    if m2:
+        candidate = m2.group(1).strip()
+        # recortar si sigue con coma y cosas no dirección
+        candidate = candidate.strip(" ,;:-")
+        return candidate
+
+    return None
+
+
+# -------------------------
+# Adjustment (simple rule)
+# -------------------------
+def detect_adjustment(text: str, currency: str) -> Dict[str, Any]:
+    """
+    Reglas simples:
+    - Si menciona IPC y moneda ARS => IPC trimestral
+    - Si no => NONE
+    """
+    if currency == "ARS" and re.search(r"\bIPC\b|índice\s+de\s+precios", text, re.IGNORECASE):
         return {"type": "IPC_QUARTERLY", "frequencyMonths": 3}
     return {"type": "NONE"}
 
-# =========================
-# API
-# =========================
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
+
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
     content = await file.read()
     text = extract_text_from_file(content, file.filename)
+    text = normalize_spaces(text)
 
-    owner, tenant = detect_parties(text)
     property_label = detect_property_label(text)
-    start_date, end_date = detect_dates(text)
-    amount, currency = detect_amount_and_currency(text)
 
-    adjustment = build_adjustment(amount, currency)
+    owner, tenant, owner_role, tenant_role = detect_parties(text)
+    start_date, end_date = find_date_by_patterns(text)
+
+    currency = detect_currency(text)
+    amount = detect_amount(text)
+
+    adjustment = detect_adjustment(text, currency)
 
     return {
         "extracted": {
@@ -383,6 +402,11 @@ async def extract(file: UploadFile = File(...)):
             "endDate": end_date,
             "amount": amount,
             "currency": currency,
-            "adjustment": adjustment
-        }
+            "adjustment": adjustment,
+            # Opcional: metadata útil para debug/UX
+            "roles": {
+                "ownerRole": owner_role,
+                "tenantRole": tenant_role,
+            }
+        },
     }
