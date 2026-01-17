@@ -7,19 +7,19 @@ export default function App() {
   return (
     <BrowserRouter>
       <Routes>
-        {/* Login siempre público */}
         <Route path="/login" element={<Login />} />
 
-        {/* Todo lo demás protegido */}
-        <Route element={<ProtectedRoute />}>
-          <Route path="/" element={<Dashboard />} />
-          {/* Si tenés otras páginas, agregalas acá adentro */}
-          {/* <Route path="/contratos" element={<Contratos />} /> */}
-          {/* <Route path="/propiedades" element={<Propiedades />} /> */}
-        </Route>
+        <Route
+          path="/dashboard"
+          element={
+            <ProtectedRoute>
+              <Dashboard />
+            </ProtectedRoute>
+          }
+        />
 
         {/* fallback */}
-        <Route path="*" element={<div style={{ padding: 24 }}>404 Not Found</div>} />
+        <Route path="*" element={<Login />} />
       </Routes>
     </BrowserRouter>
   );
