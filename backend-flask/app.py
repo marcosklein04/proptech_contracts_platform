@@ -4,13 +4,42 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from sqlalchemy import create_engine, text
 
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+def _build_requests_session() -> requests.Session:
+    """
+    Session con retries para llamadas a la IA (Render puede tardar por cold start).
+    """
+    retries = int(os.getenv("IA_RETRIES", "2"))
+    backoff = float(os.getenv("IA_BACKOFF", "0.6"))
+
+    retry = Retry(
+        total=retries,
+        connect=retries,
+        read=retries,
+        status=retries,
+        backoff_factor=backoff,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["POST"]),
+        raise_on_status=False,
+    )
+
+    s = requests.Session()
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+
 def create_app():
     app = Flask(__name__)
 
     # =========================
-    # CORS (PROD-ready)
+    # CORS
     # =========================
-    cors_origins = os.getenv("CORS_ORIGINS", "*").strip()
+    cors_origins = (os.getenv("CORS_ORIGINS", "*") or "*").strip()
 
     if cors_origins == "*":
         origins = "*"
@@ -20,7 +49,7 @@ def create_app():
     CORS(
         app,
         resources={r"/*": {"origins": origins}},
-        supports_credentials=False,  # no cookies; evita conflicto con '*'
+        supports_credentials=False,  # no cookies
         allow_headers=["Content-Type", "Authorization"],
         methods=["GET", "POST", "OPTIONS"],
     )
@@ -54,13 +83,11 @@ def create_app():
     # =========================
     # IA Service
     # =========================
-    IA_EXTRACTOR_URL = os.getenv("IA_EXTRACTOR_URL", "http://127.0.0.1:8001/extract")
+    raw_ia_url = os.getenv("IA_EXTRACTOR_URL", "http://127.0.0.1:8001/extract")
+    IA_EXTRACTOR_URL = (raw_ia_url or "").strip().rstrip("/")  # evita espacios y slash final
 
-    # Timeouts (segundos)
-    # connect_timeout: tiempo máximo para conectar
-    # read_timeout: tiempo máximo esperando respuesta (documentos largos)
-    IA_CONNECT_TIMEOUT = int(os.getenv("IA_CONNECT_TIMEOUT", "10"))
-    IA_READ_TIMEOUT = int(os.getenv("IA_READ_TIMEOUT", "300"))  # 5 min recomendado
+    IA_TIMEOUT = int(os.getenv("IA_TIMEOUT", "180"))  # antes 60 -> causa 502 por timeout
+    session = _build_requests_session()
 
     # =========================
     # Routes
@@ -68,18 +95,6 @@ def create_app():
     @app.get("/health")
     def health():
         return {"ok": True}
-
-    # Opcional: verificar IA desde backend
-    @app.get("/ia/health")
-    def ia_health():
-        try:
-            # Si tu IA tiene /health (la tuya lo tiene)
-            base = IA_EXTRACTOR_URL.replace("/extract", "")
-            r = requests.get(f"{base}/health", timeout=(IA_CONNECT_TIMEOUT, 30))
-            r.raise_for_status()
-            return r.json(), 200
-        except Exception as e:
-            return {"ok": False, "detail": str(e)}, 502
 
     @app.get("/contracts")
     def list_contracts():
@@ -144,8 +159,9 @@ def create_app():
 
     @app.post("/contracts/upload")
     def upload_contract():
-        init_db()
-
+        """
+        Recibe PDF/DOCX y lo manda al microservicio IA (/extract).
+        """
         if "file" not in request.files:
             return {"error": "file is required (multipart/form-data)"}, 400
 
@@ -157,37 +173,25 @@ def create_app():
         if not (filename.endswith(".pdf") or filename.endswith(".docx")):
             return {"error": "Only .pdf or .docx supported"}, 400
 
-        # Nota: read() consume el stream; está bien para mandarlo a IA
+        # IMPORTANTE: leer bytes una vez
         file_bytes = f.read()
         files = {"file": (f.filename, file_bytes, "application/octet-stream")}
 
         try:
-            r = requests.post(
-                IA_EXTRACTOR_URL,
-                files=files,
-                timeout=(IA_CONNECT_TIMEOUT, IA_READ_TIMEOUT),
-            )
-            r.raise_for_status()
-
-            # Asegurar JSON
-            try:
-                return jsonify(r.json()), 200
-            except ValueError:
-                return {
-                    "error": "IA returned non-JSON response",
-                    "status_code": r.status_code,
-                    "text_preview": r.text[:400],
-                }, 502
-
-        except requests.Timeout:
-            return {
-                "error": "IA service timeout",
-                "detail": f"Timeout after {IA_READ_TIMEOUT}s waiting IA response",
-            }, 502
+            r = session.post(IA_EXTRACTOR_URL, files=files, timeout=IA_TIMEOUT)
+            if r.status_code >= 400:
+                return {"error": "IA service error", "status": r.status_code, "detail": r.text[:500]}, 502
         except requests.RequestException as e:
             return {"error": "IA service unavailable", "detail": str(e)}, 502
 
+        # Respuesta IA
+        try:
+            return r.json(), 200
+        except Exception:
+            return {"error": "IA returned non-JSON", "detail": r.text[:800]}, 502
+
     return app
+
 
 app = create_app()
 
